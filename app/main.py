@@ -14,12 +14,15 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from .detection import analyze_series
+from .incidents import aggregate_incidents
 from .lag_correlation import scan_lag_correlation
 from .models import (
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
     HealthResponse,
+    IncidentAggregateRequest,
+    IncidentAggregateResponse,
     LagCorrelationRequest,
     LagCorrelationResponse,
     TrendRequest,
@@ -42,9 +45,11 @@ app = FastAPI(
         "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
         "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间；"
         "时滞关联扫描对 driver / response 双序列按候选时滞平移并做一对一最近邻匹配，"
-        "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag。"
+        "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag；"
+        "事件聚合读取已保存检测的异常段，按时间重叠或间隔不超过 gap_seconds "
+        "跨检测聚合为事件（只读，不修改检测记录）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +170,33 @@ def list_detections(
     """列出历史检测（摘要信息），可按 series_id 过滤。"""
     items, total = database.list_detections(series_id=series_id, limit=limit, offset=offset)
     return {"items": items, "total": total}
+
+
+@app.post(
+    "/api/v1/incidents/aggregate",
+    response_model=IncidentAggregateResponse,
+    tags=["事件聚合"],
+)
+def aggregate_incidents_endpoint(req: IncidentAggregateRequest) -> dict:
+    """读取已保存检测的异常段，按时间重叠或间隔不超过 gap_seconds 聚合为事件。
+
+    只读取检测记录，不做任何写入或修改。任一 detection_id 不存在返回 404；
+    请求体校验失败（空列表、超过 50 个、重复 ID、负间隔等）返回 422。
+    """
+    records: list[dict] = []
+    missing: list[str] = []
+    for detection_id in req.detection_ids:
+        record = database.get_detection(detection_id)
+        if record is None:
+            missing.append(detection_id)
+        else:
+            records.append(record)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"检测结果不存在: {', '.join(missing)}",
+        )
+    return aggregate_incidents(records, gap_seconds=req.gap_seconds)
 
 
 @app.post("/api/v1/trends", response_model=TrendResponse, tags=["趋势"])

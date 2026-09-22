@@ -432,6 +432,75 @@ class DetectionListResponse(BaseModel):
     total: int
 
 
+class IncidentAggregateRequest(BaseModel):
+    """事件聚合请求：把多条已保存检测的异常段按时间邻近关系聚合。"""
+
+    detection_ids: list[str] = Field(
+        min_length=1,
+        max_length=50,
+        description="参与聚合的检测 ID（1~50 个，不可重复；任一不存在返回 404）",
+    )
+    gap_seconds: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "允许桥接的最大时间间隔（秒，非负）：两个异常段时间重叠、首尾相接或"
+            "间隔不超过该值即归入同一事件；同一检测的相邻异常段同样按此规则合并"
+        ),
+    )
+
+    @field_validator("detection_ids")
+    @classmethod
+    def _no_duplicate_ids(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("detection_ids 不得包含重复 ID")
+        return v
+
+
+class IncidentMember(BaseModel):
+    """事件成员：一个检测中的一个异常段的稳定定位。"""
+
+    detection_id: str = Field(description="来源检测 ID")
+    series_id: str | None = Field(description="来源检测的业务序列标识；未设置时为 null")
+    segment_index: int = Field(
+        description="该异常段在来源检测结果 segments[] 中的序号（从 0 开始）"
+    )
+    start_index: int = Field(description="段在来源检测序列中的起始点索引")
+    end_index: int = Field(description="段在来源检测序列中的结束点索引")
+    start_time: str
+    end_time: str
+    point_count: int = Field(description="段覆盖的原始点数（含桥接正常点）")
+    anomaly_point_count: int = Field(description="段内实际触发的异常点数")
+    max_abs_zscore: float = Field(description="该段的最大绝对 z 分数")
+
+
+class Incident(BaseModel):
+    """聚合后的事件。"""
+
+    start_time: str = Field(description="事件起始时间（最早成员段开始时间）")
+    end_time: str = Field(description="事件结束时间（最晚成员段结束时间）")
+    series_ids: list[str] = Field(
+        description="覆盖的业务 series_id（去重、字典序排序；未设置 series_id 的检测不计入）"
+    )
+    detection_ids: list[str] = Field(description="覆盖的检测 ID（去重、字典序排序）")
+    segment_count: int = Field(description="成员异常段总数")
+    max_abs_zscore: float = Field(description="全部成员段中的最大绝对 z 分数")
+    members: list[IncidentMember] = Field(
+        description=(
+            "成员段定位，按 (start_time, detection_id, segment_index) 稳定排序"
+        )
+    )
+
+
+class IncidentAggregateResponse(BaseModel):
+    gap_seconds: float
+    detection_count: int = Field(description="参与聚合的检测数")
+    segment_count: int = Field(description="参与聚合的异常段总数（无异常的检测贡献 0 段）")
+    incident_count: int = Field(description="聚合后的事件数（所有检测均无异常时为 0）")
+    incidents: list[Incident] = Field(description="事件列表，按事件起始时间稳定排序")
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class HealthResponse(BaseModel):
     status: str
     database: str

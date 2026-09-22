@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描与双序列时滞关联扫描服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描与跨检测事件聚合服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。
 
 ## 特性
 
@@ -15,6 +15,7 @@
 - **采样断档感知 `gap_reset_factor`**（可选，默认关闭）：以排序后相邻点**正时间差的中位数**估算常规采样间隔，相邻间隔超过 `gap_reset_factor` 倍即判定为断档并切分采样分段。每个分段独立执行 `min_window` 预热，rolling/guarded 的基线、guarded 的连续异常计数与重建代次都在分段起点从头开始，异常区间**绝不跨越断档合并**。响应返回断档边界、估算间隔与逐点 / 逐区间的分段编号；断档后即使水位整体迁移，也不会拿断档前的旧基线误报。
 - **趋势扫描**：以 `window_size` / `step_size` 滑窗，每窗执行含**重复值方差修正**与**连续性校正**的 Mann-Kendall 检验，并按**实际时间差**计算 Theil-Sen 斜率（值/秒，非等距采样同样适用）；仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升 / 下降趋势；方向相同、时间范围重叠或首尾相接的显著窗口自动合并为趋势区间，返回区间范围、成员窗口、最小 p 值与成员斜率中位数。
 - **时滞关联扫描**：对 driver / response 双序列，按候选 `lag_seconds` 逐个把 driver 时间平移 `+lag`，再按时间顺序做**贪心一对一最近邻匹配**（容差 `match_tolerance_seconds` 内取最近点，等距取较早 response，已匹配点不复用）；仅对**配对数 ≥ min_pairs 且两侧方差非零**的候选计算 Pearson 相关系数，逐候选返回配对数、相关系数、可用状态与不可用原因；`best_lag` 按 |correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小依次确定，无可用候选时为 `null`。
+- **跨检测事件聚合**：`POST /api/v1/incidents/aggregate` 接收 1~50 个已保存的 `detection_id` 与非负 `gap_seconds`，把各检测的异常段统一按时间排序后顺序扫描——下一段开始时间不晚于当前事件结束时间 `+ gap_seconds`（即**时间重叠、首尾相接或间隔不超过 gap**）即并入同一事件，因此**同一检测的相邻异常段**同样会被合并，邻近关系可链式传递。每个事件返回起止时间、覆盖的 `series_id` / `detection_id`、成员段数、成员中的最大绝对 z 分数，以及按 `(start_time, detection_id, segment_index)` 稳定排序、可回溯到来源段的成员定位。接口只读，不写入或修改任何检测记录。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
 - **接口文档**：启动后访问 Swagger UI `/docs`、ReDoc `/redoc`。
@@ -29,6 +30,7 @@
 │   ├── detection.py        # 滑动窗口稳健异常检测核心算法
 │   ├── trends.py           # 滑窗 Mann-Kendall + Theil-Sen 趋势扫描
 │   ├── lag_correlation.py  # 双序列时滞关联扫描（平移 + 一对一匹配 + Pearson）
+│   ├── incidents.py        # 已保存检测异常段的跨检测事件聚合（只读）
 │   ├── models.py           # Pydantic 请求/响应模型、时间戳解析
 │   └── database.py         # SQLite 存储层
 ├── examples/
@@ -157,6 +159,61 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - 摘要：`driver_point_count`、`response_point_count`、`match_tolerance_seconds`、`min_pairs` 回显，以及 `candidate_count`（候选总数）与 `usable_candidate_count`（可用候选数）；
 - `candidates[]`：按请求顺序逐候选返回 `lag_seconds`、`pair_count`（一对一匹配得到的配对数）、`correlation`（Pearson 相关系数，不可用时为 `null`）、`usable`（可用状态）与 `reason`（不可用原因，可用时为 `null`）；
 - `best_lag`：可用候选中按 **|correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小**依次确定的最优时滞（秒）；无可用候选时为 `null`。
+
+### `POST /api/v1/incidents/aggregate` — 跨检测事件聚合
+
+读取 1~50 条**已保存检测**的异常段，按时间邻近关系聚合为事件。**只读接口：只查询 SQLite，不写入或修改任何检测记录；无状态，聚合结果不入库。**
+
+聚合规则：取请求所列检测的全部异常段，统一按 `(start_time, detection_id, segment_index)` 排序后顺序扫描；只要下一段的开始时间 **不晚于当前事件结束时间 + `gap_seconds`**，即把该段并入当前事件。因此：
+
+- 时间**重叠**（含跨检测重叠）、**首尾相接**（`gap_seconds=0` 时下一段起点等于上一段终点）或两段**间隔 ≤ `gap_seconds`** 都会合并；间隔恰好等于 `gap_seconds` 也算合并；
+- **同一检测的相邻异常段**与跨检测段一视同仁，同样可以合并；
+- 邻近关系可**链式传递**：A 与 B 邻近、B 与 C 邻近，即使 A 与 C 不直接邻近也归入同一事件。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `detection_ids` | `[string]` | 必填（1~50 个） | 参与聚合的检测 ID，**不可重复**；任一 ID 不存在返回 **404**（错误详情列出未知 ID） |
+| `gap_seconds` | float | 必填 | 允许桥接的最大时间间隔（秒），必须 **≥ 0 且有限**；负数 / NaN / Infinity 返回 422 |
+
+约束：列表为空、超过 50 个、包含重复 ID 返回 422；`gap_seconds < 0` 或非有限返回 422；任一 `detection_id` 未知返回 404。检测本身**没有异常段**（`anomaly_segment_count=0`）不算错误，只是不贡献成员；全部检测均无异常时 `incident_count=0`。
+
+响应：
+
+- 摘要：`gap_seconds`（回显）、`detection_count`（参与检测数）、`segment_count`（参与聚合的异常段总数）、`incident_count`（事件数）；
+- `incidents[]`：按事件**起始时间稳定排序**，每个事件含
+  - `start_time` / `end_time`：事件起止（最早成员段开始 / 最晚成员段结束）；
+  - `series_ids`：覆盖的业务 `series_id`（去重、字典序；未设置 `series_id` 的检测不计入）；
+  - `detection_ids`：覆盖的检测 ID（去重、字典序）；
+  - `segment_count`：成员异常段总数；
+  - `max_abs_zscore`：全部成员段中的最大绝对 z 分数；
+  - `members[]`：成员段定位，按 `(start_time, detection_id, segment_index)` **稳定排序**，每个成员含 `detection_id`、`series_id`、`segment_index`（该段在来源检测 `segments[]` 中的序号，从 0 开始）、`start_index` / `end_index`（来源序列中的点索引）、`start_time` / `end_time`、`point_count` / `anomaly_point_count` 与该段 `max_abs_zscore`——凭 `(detection_id, segment_index)` 可直接回溯 `GET /api/v1/detections/{id}` 返回的对应异常段。
+
+```json
+{
+  "gap_seconds": 300.0,
+  "detection_count": 2,
+  "segment_count": 3,
+  "incident_count": 1,
+  "incidents": [
+    {
+      "start_time": "2026-09-22T09:15:00+00:00",
+      "end_time": "2026-09-22T09:30:00+00:00",
+      "series_ids": ["incident-series-a", "incident-series-b"],
+      "detection_ids": ["a1b2...", "c3d4..."],
+      "segment_count": 3,
+      "max_abs_zscore": 42.7,
+      "members": [
+        {"detection_id": "a1b2...", "series_id": "incident-series-a", "segment_index": 0,
+         "start_index": 15, "end_index": 15,
+         "start_time": "2026-09-22T09:15:00+00:00", "end_time": "2026-09-22T09:15:00+00:00",
+         "point_count": 1, "anomaly_point_count": 1, "max_abs_zscore": 42.7}
+      ]
+    }
+  ]
+}
+```
 
 ### `GET /health` — 健康检查
 
@@ -293,6 +350,23 @@ curl -s -X POST http://localhost:8000/api/v1/lag-correlation \
 ```
 
 候选不可用时 `correlation` 为 `null` 且 `reason` 给出原因，例如配对数不足（`"配对数 2 少于 min_pairs=3，未计算相关"`）或某一侧配对值恒定（`"driver 侧配对值方差为零，Pearson 相关未定义"`）；全部候选不可用时 `best_lag` 为 `null`。
+
+### 跨检测事件聚合（incidents/aggregate）
+
+```bash
+# 先提交两条检测（可来自不同序列），记下各自返回的 id：
+ID_A=$(curl -s -X POST http://localhost:8000/api/v1/detections \
+  -H "Content-Type: application/json" -d @examples/request.json | python -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+ID_B=$(curl -s -X POST http://localhost:8000/api/v1/detections \
+  -H "Content-Type: application/json" -d @examples/request_gap.json | python -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 时间重叠或间隔不超过 300 秒的异常段聚合为同一事件（同一检测的相邻段也合并）
+curl -s -X POST http://localhost:8000/api/v1/incidents/aggregate \
+  -H "Content-Type: application/json" \
+  -d "{\"detection_ids\": [\"$ID_A\", \"$ID_B\"], \"gap_seconds\": 300}" | python -m json.tool
+```
+
+`gap_seconds=0` 时只合并时间重叠或首尾相接的段；未知 ID 返回 404，空列表 / 超过 50 个 ID / 重复 ID / 负间隔返回 422。接口只读，聚合前后 `GET /api/v1/detections/{id}` 的结果不变。
 
 ### 内联 JSON 示例
 
@@ -463,6 +537,16 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 匹配为时间顺序单次扫描的贪心策略（不保证全局最优配对，但确定性强、可解释），整体复杂度约 `O(候选数 × (n_driver + n_response))` 量级；接口无状态，结果不写入 SQLite。
 
+### 事件聚合算法（`POST /api/v1/incidents/aggregate`）
+
+1. 按请求顺序逐个 `GET` 检测记录（只读 SQLite）；任一 ID 不存在立即返回 404，不做部分聚合。
+2. 从每条检测的 `segments[]` 抽取成员段，保留其在来源检测中的 `segment_index` 与起止点索引，无异常段的检测贡献 0 个成员。
+3. 全部成员按 `(start_time, detection_id, segment_index)` 稳定排序；ISO-8601 时间均为带 UTC 偏移的归一化格式，可直接做字典序比较。
+4. 顺序扫描维护当前事件及其结束时间：成员 `start_time ≤ 事件结束时间 + gap_seconds` 即并入（重叠 / 相接 / 近邻），并在成员段更晚结束时顺延事件结束时间——因此邻近关系可链式传递，同一检测的相邻段也自然合并；否则关闭当前事件、开启新事件。
+5. 每个事件汇总起止时间、去重排序的 `series_ids` / `detection_ids`、成员段数与成员最大绝对 z 分数；事件列表按起始时间输出（成员已按起点排序，首个成员起点即事件起点）。
+
+整体复杂度约 `O(S log S)`（`S` 为参与聚合的异常段总数，`S ≤ 各检测段数之和`）；接口不写入数据库，聚合结果不持久化。
+
 ## 运行测试
 
 ```bash
@@ -470,7 +554,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）。
 
 ## 备注
 
