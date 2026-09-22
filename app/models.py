@@ -432,6 +432,60 @@ class DetectionListResponse(BaseModel):
     total: int
 
 
+class IncidentAggregateRequest(BaseModel):
+    """事件聚合请求：把多个已保存检测的异常段按时间聚合为事件。"""
+
+    detection_ids: list[str] = Field(
+        min_length=1,
+        max_length=50,
+        description="要聚合的检测 ID（1~50 个；重复 ID 自动去重，任一 ID 不存在返回 404）",
+    )
+    gap_seconds: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "聚合间隔（秒，≥0 且有限）：时间重叠或间隔不超过该值的异常段"
+            "合并为同一事件；同一检测的相邻段同样可合并"
+        ),
+    )
+
+
+class IncidentMember(BaseModel):
+    """事件成员：某个检测中的一个异常段。"""
+
+    detection_id: str
+    series_id: str | None
+    segment_index: int = Field(description="该段在其检测结果 segments 列表中的下标（从 0 开始）")
+    start_time: str
+    end_time: str
+    max_abs_zscore: float = Field(description="该段的最大绝对 z 分数")
+
+
+class Incident(BaseModel):
+    """聚合后的事件。"""
+
+    start_time: str = Field(description="事件开始时间（首个成员段的开始时间）")
+    end_time: str = Field(description="事件结束时间（成员段结束时间的最大值）")
+    series_ids: list[str] = Field(
+        description="事件覆盖的业务序列（去重、按字典序；series_id 为 null 的检测不计入）"
+    )
+    detection_ids: list[str] = Field(description="事件覆盖的检测 ID（去重、按字典序）")
+    segment_count: int = Field(description="事件包含的异常段数")
+    max_abs_zscore: float = Field(description="全部成员段中的最大绝对 z 分数")
+    members: list[IncidentMember] = Field(
+        description="成员段定位，按 (开始时间, detection_id, 段内编号) 稳定排序"
+    )
+
+
+class IncidentAggregateResponse(BaseModel):
+    detection_count: int = Field(description="实际读取的检测数（请求 ID 去重后）")
+    segment_count: int = Field(description="参与聚合的异常段总数")
+    gap_seconds: float
+    incident_count: int = Field(description="聚合得到的事件数")
+    incidents: list[Incident]
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class HealthResponse(BaseModel):
     status: str
     database: str

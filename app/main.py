@@ -1,4 +1,4 @@
-"""FastAPI 应用：时间序列异常检测 + 趋势扫描 + 双序列时滞关联扫描接口。"""
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描 + 双序列时滞关联扫描 + 事件聚合接口。"""
 
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from .detection import analyze_series
+from .incidents import aggregate_incidents
 from .lag_correlation import scan_lag_correlation
 from .models import (
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
     HealthResponse,
+    IncidentAggregateRequest,
+    IncidentAggregateResponse,
     LagCorrelationRequest,
     LagCorrelationResponse,
     TrendRequest,
@@ -42,9 +45,11 @@ app = FastAPI(
         "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
         "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间；"
         "时滞关联扫描对 driver / response 双序列按候选时滞平移并做一对一最近邻匹配，"
-        "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag。"
+        "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag；"
+        "事件聚合把多个已保存检测的异常段按时间重叠或间隔不超过 gap_seconds "
+        "合并为事件（只读，不修改检测记录）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +170,44 @@ def list_detections(
     """列出历史检测（摘要信息），可按 series_id 过滤。"""
     items, total = database.list_detections(series_id=series_id, limit=limit, offset=offset)
     return {"items": items, "total": total}
+
+
+@app.post(
+    "/api/v1/incidents/aggregate",
+    response_model=IncidentAggregateResponse,
+    tags=["事件聚合"],
+)
+def aggregate_detections_into_incidents(req: IncidentAggregateRequest) -> dict:
+    """把多个已保存检测的异常段按时间重叠 / 间隔不超过 gap_seconds 聚合为事件。
+
+    只读接口：不修改任何检测记录。任一 detection_id 不存在返回 404。
+    """
+    # 重复 ID 去重（保持请求顺序），避免同一检测的段被重复计数
+    unique_ids = list(dict.fromkeys(req.detection_ids))
+
+    segments: list[dict[str, Any]] = []
+    for detection_id in unique_ids:
+        record = database.get_detection(detection_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"检测结果不存在: {detection_id}")
+        for segment_index, seg in enumerate(record["result"]["segments"]):
+            segments.append(
+                {
+                    "detection_id": detection_id,
+                    "series_id": record["series_id"],
+                    "segment_index": segment_index,
+                    "start_time": seg["start_time"],
+                    "end_time": seg["end_time"],
+                    "max_abs_zscore": seg["score"]["max_abs_zscore"],
+                }
+            )
+
+    result = aggregate_incidents(segments, gap_seconds=req.gap_seconds)
+    return {
+        "detection_count": len(unique_ids),
+        "gap_seconds": req.gap_seconds,
+        **result,
+    }
 
 
 @app.post("/api/v1/trends", response_model=TrendResponse, tags=["趋势"])

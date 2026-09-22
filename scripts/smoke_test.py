@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.detection import analyze_series  # noqa: E402
+from app.incidents import aggregate_incidents  # noqa: E402
 from app.lag_correlation import (  # noqa: E402
     _match_pairs,
     _select_best_lag,
@@ -565,6 +566,103 @@ def test_lag_best_lag_tiebreak() -> None:
     print("✓ best_lag 决胜规则：|corr| → 配对数 → |lag| → lag，无可用候选为 null")
 
 
+def _incident_seg(
+    detection_id: str,
+    series_id: str | None,
+    idx: int,
+    start: str,
+    end: str,
+    max_z: float,
+) -> dict:
+    return {
+        "detection_id": detection_id,
+        "series_id": series_id,
+        "segment_index": idx,
+        "start_time": start,
+        "end_time": end,
+        "max_abs_zscore": max_z,
+    }
+
+
+def test_incident_aggregation_merge_rules() -> None:
+    """事件聚合：重叠 / 间隔 ≤ gap_seconds 合并（含同一检测相邻段），否则拆分。"""
+    # 跨检测重叠合并；被包含的短段不缩短事件终点；间隔 > gap_seconds 拆分
+    segs = [
+        _incident_seg("det-a", "series-x", 0, "2026-09-20T10:00:00+00:00", "2026-09-20T10:30:00+00:00", 5.0),
+        _incident_seg("det-b", "series-x", 0, "2026-09-20T10:05:00+00:00", "2026-09-20T10:10:00+00:00", 7.5),
+        _incident_seg("det-c", None, 0, "2026-09-20T10:35:00+00:00", "2026-09-20T10:40:00+00:00", 4.0),
+    ]
+    result = aggregate_incidents(segs, gap_seconds=0.0)
+    assert result["segment_count"] == 3
+    assert result["incident_count"] == 2
+    first, second = result["incidents"]
+    assert first["start_time"] == "2026-09-20T10:00:00+00:00"
+    assert first["end_time"] == "2026-09-20T10:30:00+00:00"  # 成员结束时间的最大值
+    assert first["segment_count"] == 2
+    assert first["max_abs_zscore"] == 7.5  # 成员段最大 |z|
+    assert first["detection_ids"] == ["det-a", "det-b"]
+    assert first["series_ids"] == ["series-x"]
+    assert [m["detection_id"] for m in first["members"]] == ["det-a", "det-b"]
+    assert [m["segment_index"] for m in first["members"]] == [0, 0]
+    assert second["series_ids"] == []  # series_id 为 null 不计入覆盖序列
+    assert second["detection_ids"] == ["det-c"]
+    assert second["segment_count"] == 1
+
+    # 间隔恰等于 gap_seconds 也合并（<= 即合并），差一点都不行
+    pair = [
+        _incident_seg("det-a", None, 0, "2026-09-20T10:00:00+00:00", "2026-09-20T10:10:00+00:00", 5.0),
+        _incident_seg("det-b", None, 0, "2026-09-20T10:15:00+00:00", "2026-09-20T10:20:00+00:00", 6.0),
+    ]
+    assert aggregate_incidents(pair, gap_seconds=300.0)["incident_count"] == 1
+    assert aggregate_incidents(pair, gap_seconds=299.9)["incident_count"] == 2
+
+    # 同一检测的相邻段同样按时间规则合并
+    same = [
+        _incident_seg("det-a", "s", 0, "2026-09-20T10:00:00+00:00", "2026-09-20T10:05:00+00:00", 5.0),
+        _incident_seg("det-a", "s", 1, "2026-09-20T10:08:00+00:00", "2026-09-20T10:12:00+00:00", 6.0),
+    ]
+    merged = aggregate_incidents(same, gap_seconds=300.0)
+    assert merged["incident_count"] == 1
+    inc = merged["incidents"][0]
+    assert inc["segment_count"] == 2
+    assert inc["detection_ids"] == ["det-a"]
+    assert inc["series_ids"] == ["s"]
+    assert [m["segment_index"] for m in inc["members"]] == [0, 1]
+    assert aggregate_incidents(same, gap_seconds=100.0)["incident_count"] == 2
+
+    # 链式合并：A-B、B-C 间隔都在 gap 内，则三段同事件（即使 A-C 间隔超 gap）
+    chain = [
+        _incident_seg("det-a", None, 0, "2026-09-20T10:00:00+00:00", "2026-09-20T10:05:00+00:00", 5.0),
+        _incident_seg("det-b", None, 0, "2026-09-20T10:08:00+00:00", "2026-09-20T10:10:00+00:00", 6.0),
+        _incident_seg("det-c", None, 0, "2026-09-20T10:13:00+00:00", "2026-09-20T10:15:00+00:00", 7.0),
+    ]
+    chained = aggregate_incidents(chain, gap_seconds=200.0)
+    assert chained["incident_count"] == 1
+    assert chained["incidents"][0]["end_time"] == "2026-09-20T10:15:00+00:00"
+    assert chained["incidents"][0]["max_abs_zscore"] == 7.0
+
+    # 成员稳定排序：开始时间相同按 detection_id，再按段内编号；与输入顺序无关
+    ties = [
+        _incident_seg("det-b", None, 0, "2026-09-20T10:00:00+00:00", "2026-09-20T10:01:00+00:00", 5.0),
+        _incident_seg("det-a", None, 1, "2026-09-20T10:00:00+00:00", "2026-09-20T10:02:00+00:00", 6.0),
+        _incident_seg("det-a", None, 0, "2026-09-20T09:59:00+00:00", "2026-09-20T10:00:00+00:00", 4.0),
+    ]
+    ordered = aggregate_incidents(ties, gap_seconds=0.0)
+    assert ordered["incident_count"] == 1
+    members = ordered["incidents"][0]["members"]
+    assert [(m["detection_id"], m["segment_index"]) for m in members] == [
+        ("det-a", 0),
+        ("det-a", 1),
+        ("det-b", 0),
+    ]
+
+    # 空段列表：无事件
+    empty = aggregate_incidents([], gap_seconds=60.0)
+    assert empty["segment_count"] == 0 and empty["incident_count"] == 0
+    assert empty["incidents"] == []
+    print("✓ 事件聚合：重叠/间隔合并、同检测相邻段、链式合并、成员稳定排序、空输入正确")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -906,7 +1004,184 @@ def _exercise_api(client: "TestClient") -> None:
     r = client.post("/api/v1/lag-correlation", json=bad)
     assert r.status_code == 422 and "response_points" in r.text
 
-    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / 趋势扫描 / 时滞关联")
+    # 事件聚合：检测 A 在 08:05 / 08:15 各有一段异常，检测 B 在 08:20 有一段
+    inc_base = datetime(2026, 9, 20, 8, 0, 0, tzinfo=timezone.utc)
+    inc_points_a = []
+    for i in range(20):
+        v = 1.0 + (i % 2) * 0.05
+        if i in (5, 15):
+            v = 9.0
+        inc_points_a.append(
+            {"timestamp": (inc_base + timedelta(minutes=i)).isoformat(), "value": v}
+        )
+    inc_payload_a = {
+        "series_id": "inc-series-a",
+        "window_size": 10,
+        "min_window": 3,
+        "threshold": 3.0,
+        "merge_gap": 1,
+        "points": inc_points_a,
+    }
+    r = client.post("/api/v1/detections", json=inc_payload_a)
+    assert r.status_code == 201, r.text
+    inc_a = r.json()
+    id_a = inc_a["id"]
+    assert [(s["start_time"], s["end_time"]) for s in inc_a["segments"]] == [
+        ("2026-09-20T08:05:00+00:00", "2026-09-20T08:05:00+00:00"),
+        ("2026-09-20T08:15:00+00:00", "2026-09-20T08:15:00+00:00"),
+    ]
+
+    inc_points_b = []
+    for i in range(10):
+        v = 1.0 + (i % 2) * 0.05
+        if i == 3:
+            v = 9.0
+        inc_points_b.append(
+            {"timestamp": (inc_base + timedelta(minutes=17 + i)).isoformat(), "value": v}
+        )
+    r = client.post(
+        "/api/v1/detections",
+        json={**inc_payload_a, "series_id": "inc-series-b", "points": inc_points_b},
+    )
+    assert r.status_code == 201, r.text
+    id_b = r.json()["id"]
+
+    # 无异常检测：参与聚合但不贡献段
+    r = client.post(
+        "/api/v1/detections",
+        json={
+            **inc_payload_a,
+            "series_id": "inc-series-calm",
+            "points": [
+                {
+                    "timestamp": (inc_base + timedelta(hours=2, minutes=i)).isoformat(),
+                    "value": 1.0 + (i % 2) * 0.05,
+                }
+                for i in range(10)
+            ],
+        },
+    )
+    assert r.status_code == 201, r.text
+    id_calm = r.json()["id"]
+    assert r.json()["anomaly_segment_count"] == 0
+
+    # 聚合前记录检测 A 的快照与列表总数，验证接口只读
+    snapshot_a = client.get(f"/api/v1/detections/{id_a}").json()
+    total_before = client.get("/api/v1/detections").json()["total"]
+
+    # gap_seconds=300：A 两段相隔 10 分钟拆开，B 段与 A 第二段间隔恰 5 分钟合并
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a, id_b], "gap_seconds": 300},
+    )
+    assert r.status_code == 200, r.text
+    agg = r.json()
+    assert agg["detection_count"] == 2
+    assert agg["segment_count"] == 3
+    assert agg["gap_seconds"] == 300
+    assert agg["incident_count"] == 2
+    inc1, inc2 = agg["incidents"]
+    assert inc1["start_time"] == "2026-09-20T08:05:00+00:00"
+    assert inc1["end_time"] == "2026-09-20T08:05:00+00:00"
+    assert inc1["segment_count"] == 1
+    assert inc1["detection_ids"] == [id_a]
+    assert inc1["series_ids"] == ["inc-series-a"]
+    assert inc1["max_abs_zscore"] >= 3.0
+    assert inc2["start_time"] == "2026-09-20T08:15:00+00:00"
+    assert inc2["end_time"] == "2026-09-20T08:20:00+00:00"
+    assert inc2["segment_count"] == 2
+    assert inc2["detection_ids"] == sorted([id_a, id_b])
+    assert inc2["series_ids"] == ["inc-series-a", "inc-series-b"]
+    # 成员按 (开始时间, detection_id) 稳定排序：A 的第二段在前，B 段在后
+    assert [(m["detection_id"], m["segment_index"]) for m in inc2["members"]] == [
+        (id_a, 1),
+        (id_b, 0),
+    ]
+    assert inc2["members"][0]["start_time"] == "2026-09-20T08:15:00+00:00"
+    assert inc2["members"][1]["start_time"] == "2026-09-20T08:20:00+00:00"
+    assert inc2["max_abs_zscore"] == max(
+        m["max_abs_zscore"] for m in inc2["members"]
+    )
+
+    # gap_seconds=0：三段互不重叠，各自成事件
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a, id_b], "gap_seconds": 0},
+    )
+    assert r.status_code == 200 and r.json()["incident_count"] == 3
+
+    # gap_seconds=600：A 两段间隔恰 10 分钟合并，三段链成同一事件
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a, id_b], "gap_seconds": 600},
+    )
+    assert r.status_code == 200, r.text
+    agg600 = r.json()
+    assert agg600["incident_count"] == 1
+    assert agg600["incidents"][0]["segment_count"] == 3
+    assert agg600["incidents"][0]["start_time"] == "2026-09-20T08:05:00+00:00"
+    assert agg600["incidents"][0]["end_time"] == "2026-09-20T08:20:00+00:00"
+
+    # 无异常检测单独聚合：零事件但正常返回
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_calm], "gap_seconds": 60},
+    )
+    assert r.status_code == 200, r.text
+    calm = r.json()
+    assert calm["detection_count"] == 1
+    assert calm["segment_count"] == 0 and calm["incident_count"] == 0
+    assert calm["incidents"] == []
+
+    # 重复 ID 自动去重：同一段不会被重复计数
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a, id_a], "gap_seconds": 300},
+    )
+    assert r.status_code == 200, r.text
+    dedup = r.json()
+    assert dedup["detection_count"] == 1
+    assert dedup["segment_count"] == 2 and dedup["incident_count"] == 2
+
+    # 只读：聚合后检测记录与列表总数不变
+    assert client.get(f"/api/v1/detections/{id_a}").json() == snapshot_a
+    assert client.get("/api/v1/detections").json()["total"] == total_before
+
+    # 404：任一 detection_id 未知（含已知 + 未知混合）
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": ["nonexistent"], "gap_seconds": 60},
+    )
+    assert r.status_code == 404
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a, "nonexistent"], "gap_seconds": 60},
+    )
+    assert r.status_code == 404
+
+    # 参数校验：空列表 / 超过 50 个 / 负间隔 / 非有限间隔
+    r = client.post(
+        "/api/v1/incidents/aggregate", json={"detection_ids": [], "gap_seconds": 60}
+    )
+    assert r.status_code == 422
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a] * 51, "gap_seconds": 60},
+    )
+    assert r.status_code == 422
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        json={"detection_ids": [id_a], "gap_seconds": -1},
+    )
+    assert r.status_code == 422
+    r = client.post(
+        "/api/v1/incidents/aggregate",
+        content=_json.dumps({"detection_ids": [id_a], "gap_seconds": float("nan")}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / 趋势扫描 / 时滞关联 / 事件聚合")
 
 
 if __name__ == "__main__":
@@ -929,5 +1204,6 @@ if __name__ == "__main__":
     test_lag_correlation_scan_basic()
     test_lag_correlation_unusable_candidates()
     test_lag_best_lag_tiebreak()
+    test_incident_aggregation_merge_rules()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")
